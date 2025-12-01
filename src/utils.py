@@ -1,341 +1,571 @@
 """Slack utilities for handling file operations and channel interactions.
 
-This module provides classes for interacting with Slack channels through the Slack SDK,
+This module provides functions for interacting with Slack channels through the Slack SDK,
 including functionality for polling channels for files, downloading files, uploading files,
-and managing file deletions.
+managing file deletions, and sending messages.
 
-Classes:
-    SlackBase: Base class for Slack authentication and initialization.
-    SlackPoller: Polls Slack channels for file presence.
-    SlackHandler: Handles file operations including download, upload, and deletion.
+All functions support optional parameters for channel_id and tokens, falling back to
+environment variables loaded from .env file.
+
+Public Functions:
+    Authentication:
+        test_bot_auth() - Test bot token authentication
+        test_user_auth() - Test user token authentication
+
+    File Operations:
+        poll_channel() - Check if exactly one file exists in channel
+        get_file_info() - Retrieve file metadata from channel
+        download_file() - Download file from channel to local filesystem
+        upload_file() - Upload file to channel
+        delete_file() - Delete file from channel
+
+    Messaging:
+        send_message() - Send text message to channel
 """
 
 from dotenv import load_dotenv
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.custom_logger import get_custom_logger
-import logging
 import requests
 import os
 
-class SlackBase:
-    """Base class for Slack authentication and token management.
+__all__ = [
+    'test_bot_auth',
+    'test_user_auth',
+    'poll_channel',
+    'get_file_info',
+    'download_file',
+    'upload_file',
+    'delete_file',
+    'send_message',
+    'get_config',
+]
 
-    Handles initialization with Slack API tokens and validates authentication
-    for both bot and user tokens.
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-    Attributes:
-        channel_id (str): The Slack channel ID for operations.
-        bot_token (str): The Slack bot token for API authentication.
-        user_token (str, optional): The Slack user token for user-specific operations.
-        bot_user_id (str): The user ID of the authenticated bot.
-        user_id (str, optional): The user ID of the authenticated user.
-        logger: Custom logger instance for this module.
+_config_cache = None
+
+
+def _load_config(env_file: str = ".env") -> dict:
+    """Load and cache configuration from environment variables.
+
+    Args:
+        env_file (str): Path to .env file, defaults to ".env"
+
+    Returns:
+        dict: Configuration dictionary with keys: channel_id, bot_token, user_token
     """
-
-    def __init__(self, env_file: str = ".env") -> None:
-        """Initialize SlackBase with channel and authentication tokens.
-
-        Args:
-            channel_id (str): The Slack channel ID for operations.
-            bot_token (str): The Slack bot token for API authentication.
-            user_token (str, optional): The Slack user token for user-specific operations.
-                Defaults to None.
-
-        Raises:
-            SlackApiError: If bot token authentication fails.
-        """
+    global _config_cache
+    if _config_cache is None:
         load_dotenv(env_file)
-        self.logger = get_custom_logger(__name__)
-        self.channel_id = os.getenv("CHANNEL_ID")
-        self.bot_token = os.getenv("BOT_TOKEN")
-        self._test_bot_auth()
-        try:
-            self.user_token = os.getenv("USER_TOKEN")
-            self._test_user_auth()
-        except:
-            self.logger.info("No USER_TOKEN found in .env file, proceeding without a USER_TOKEN")
+        _config_cache = {
+            'channel_id': os.getenv("CHANNEL_ID"),
+            'bot_token': os.getenv("BOT_TOKEN"),
+            'user_token': os.getenv("USER_TOKEN")
+        }
+    return _config_cache
 
-    def _test_bot_auth(self):
-        """Test bot token authentication with Slack API.
 
-        Validates the bot token by calling auth.test endpoint and stores
-        the bot user ID for reference.
+def get_config(env_file: str = ".env", force_reload: bool = False) -> dict:
+    """Get Slack configuration from environment.
 
-        Raises:
-            SlackApiError: If authentication fails.
-        """
-        try:
-            self.logger.info("Testing Slack BOT token")
-            client = WebClient(self.bot_token)
-            auth_test = client.auth_test()
-            self.bot_user_id = auth_test["user_id"]
-            self.logger.info(f"BOT Authentication successful.")
-        except SlackApiError as e:
-            self.logger.exception(e)
-            raise
-        
-    def _test_user_auth(self):
-        """Test user token authentication with Slack API.
+    Args:
+        env_file (str): Path to .env file, defaults to ".env"
+        force_reload (bool): Force reload from file (useful for testing), defaults to False
 
-        Validates the user token by calling auth.test endpoint and stores
-        the user ID for reference.
+    Returns:
+        dict: Configuration dictionary with keys: channel_id, bot_token, user_token
 
-        Raises:
-            SlackApiError: If authentication fails.
-        """
-        try:
-            self.logger.info("Testing Slack USER token")
-            client = WebClient(self.bot_token)
-            auth_test = client.auth_test()
-            self.user_id = auth_test["user_id"]
-            self.logger.info(f"USER Authentication successful.")
-        except SlackApiError as e:
-            self.logger.exception(e)
-            raise
-
-class SlackPoller(SlackBase):
-    """Polls a Slack channel for file presence.
-
-    Monitors a Slack channel to check for file uploads and enforces
-    a constraint that only one file can exist in the channel at a time.
+    Examples:
+        >>> config = get_config()
+        >>> print(config['channel_id'])
     """
+    global _config_cache
+    if force_reload:
+        _config_cache = None
+    return _load_config(env_file)
 
-    def _poll_for_one_file(self) -> bool:
-        """Check if exactly one file exists in the Slack channel.
 
-        Polls the Slack channel's files and validates that there is exactly
-        one file present.
+# ============================================================================
+# HELPER FUNCTIONS (Private)
+# ============================================================================
 
-        Returns:
-            bool: True if exactly one file exists, False if no files exist.
+_logger = None
 
-        Raises:
-            ValueError: If more than one file exists in the channel.
-            SlackApiError: If the Slack API call fails.
-        """
-        client = WebClient(self.bot_token)
-        try:
-            response = client.files_list(channel=self.channel_id)
-            if len(response["files"]) == 1:
-                self.logger.info("Poll successful. Found one file in Slack channel.")
-                return True
-            elif len(response["files"])==0 or response["files"] is None:
-                self.logger.info("Poll successful. No files in Slack channel")
-                return False
-            else:
-                error_message = "During polling, found more than one file in the channel. There can only be max one file in the channel. Manually delete the unnecesaary files in the channel."
-                logging.error(error_message)
-                raise ValueError(error_message)
-        except SlackApiError as e:
-            self.logger.exception(e)
-        
-    def poll(self) -> bool:
-        """Poll the Slack channel for file presence.
 
-        Public method that checks if exactly one file exists in the channel.
+def _get_logger():
+    """Get or create module logger.
 
-        Returns:
-            bool: True if exactly one file exists, False if no files exist.
-
-        Raises:
-            ValueError: If more than one file exists in the channel.
-            SlackApiError: If the Slack API call fails.
-        """
-        result = self._poll_for_one_file()
-        return result
-    
-class SlackHandler(SlackBase):
-    """Handles file operations in a Slack channel.
-
-    Provides methods for downloading, uploading, deleting files, and sending
-    messages to a Slack channel.
-
-    Attributes:
-        file_name (str, optional): Name of the file retrieved from the channel.
-        url_private (str, optional): Private URL of the file for authenticated access.
-        file_id (str, optional): ID of the file in Slack.
-        new_file (dict, optional): Response from file upload operation.
-        file_url (str, optional): Permalink URL of the uploaded file.
-        new_message (dict, optional): Response from message post operation.
+    Returns:
+        logging.Logger: Configured logger instance
     """
+    global _logger
+    if _logger is None:
+        _logger = get_custom_logger(__name__)
+    return _logger
 
-    # _get_file_info() can just retrieve the list of all files in the channel then filter the metadata later
-    # use this to create methods: _get_file_by_date, _get_file_by_user
-    # _get_file_info will pass the returned list of files to the filtering functions
-    # the data retrieved from these methods will be used to download a file or files
 
-    def _get_file_info(self) -> None:
-        """Retrieve file information from the Slack channel.
+def _create_bot_client(bot_token: str = None) -> WebClient:
+    """Create authenticated bot WebClient.
 
-        Gets the name, private URL, and file ID of the file in the channel.
-        Assumes only 0 or 1 files can exist in the channel.
+    Args:
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
 
-        Raises:
-            ValueError: If more than one file exists in the channel.
-            SlackApiError: If the Slack API call fails.
-        """
-        client = WebClient(self.bot_token)
-        try:
-            response = client.files_list(channel=self.channel_id)
-            if len(response["files"])==1:
-                self.file_name = response["files"][0]["name"] # this gives us name with extension
-                self.url_private = response["files"][0]["url_private"]
-                self.file_id = response["files"][0]["id"]
-                self.logger.info("Retrieved file info from file in Slack")
-            elif len(response["files"])==0 or response["files"] is None:
-                self.file_name = None
-                self.url_private = None
-                self.file_id = None
-                self.logger.info("File retrieval successful. No files in Slack channel")
-            elif len(response["files"])>1:
-                error_message = "There can only be max one file in the channel"
-                logging.error(error_message)
-                raise ValueError(error_message)
-        except SlackApiError as e:
-            self.logger.exception(e)
-        
-    def download_files(self, output_dir: str) -> None:
-        """Download a file from the Slack channel to the local filesystem.
+    Returns:
+        WebClient: Authenticated WebClient instance
 
-        Retrieves file information from the channel and downloads it to the
-        specified output directory using the private URL with bot authentication.
+    Raises:
+        ValueError: If bot_token not provided and not in environment
+    """
+    if bot_token is None:
+        config = get_config()
+        bot_token = config['bot_token']
+    if bot_token is None:
+        raise ValueError("bot_token not provided and BOT_TOKEN not in environment")
+    return WebClient(bot_token)
 
-        Args:
-            output_dir (str): Directory path where the file will be saved.
 
-        Raises:
-            RequestException: If the file download fails.
-            SlackApiError: If the Slack API call fails.
-        """
-        self._get_file_info()
-        if self.file_id is not None:
-            output_path = f"{output_dir}/{self.file_name}"
-            try:
-                headers = {'Authorization': f'Bearer {self.bot_token}'}
-                download_response = requests.get(self.url_private, headers=headers, stream=True)
-                with open(f"{output_path}", 'wb') as f:
-                    for chunk in download_response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                self.logger.info(f"File download successful. File saved to: {output_path}")
-            except requests.exceptions.RequestException as e:
-                self.logger.exception(e)
+def _create_user_client(user_token: str = None) -> WebClient:
+    """Create authenticated user WebClient.
+
+    Args:
+        user_token (str): User token, defaults to USER_TOKEN from environment
+
+    Returns:
+        WebClient: Authenticated WebClient instance
+
+    Raises:
+        ValueError: If user_token not provided and not in environment
+    """
+    if user_token is None:
+        config = get_config()
+        user_token = config['user_token']
+    if user_token is None:
+        raise ValueError("user_token not provided and USER_TOKEN not in environment")
+    return WebClient(user_token)
+
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
+
+def test_bot_auth(bot_token: str = None) -> dict:
+    """Test bot token authentication with Slack API.
+
+    Validates the bot token by calling auth.test endpoint.
+
+    Args:
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
+
+    Returns:
+        dict: Authentication response with keys: ok, url, team, user, team_id, user_id
+
+    Raises:
+        SlackApiError: If authentication fails
+        ValueError: If bot_token not provided and not in environment
+
+    Examples:
+        >>> result = test_bot_auth()
+        >>> print(result['user_id'])
+    """
+    logger = _get_logger()
+    try:
+        logger.info("Testing Slack BOT token")
+        client = _create_bot_client(bot_token)
+        auth_test = client.auth_test()
+        logger.info("BOT Authentication successful")
+        return auth_test
+    except SlackApiError as e:
+        logger.exception(f"Slack API error during bot authentication")
+        raise
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        raise
+
+
+def test_user_auth(user_token: str = None) -> dict:
+    """Test user token authentication with Slack API.
+
+    Validates the user token by calling auth.test endpoint.
+
+    Args:
+        user_token (str): User token, defaults to USER_TOKEN from environment
+
+    Returns:
+        dict: Authentication response with keys: ok, url, team, user, team_id, user_id
+
+    Raises:
+        SlackApiError: If authentication fails
+        ValueError: If user_token not provided and not in environment
+
+    Examples:
+        >>> result = test_user_auth()
+        >>> print(result['user_id'])
+    """
+    logger = _get_logger()
+    try:
+        logger.info("Testing Slack USER token")
+        client = _create_user_client(user_token)
+        auth_test = client.auth_test()
+        logger.info("USER Authentication successful")
+        return auth_test
+    except SlackApiError as e:
+        logger.exception(f"Slack API error during user authentication")
+        raise
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        raise
+
+
+# ============================================================================
+# FILE OPERATIONS
+# ============================================================================
+
+
+def poll_channel(channel_id: str = None, bot_token: str = None) -> bool:
+    """Check if exactly one file exists in the Slack channel.
+
+    Polls the Slack channel's files and validates that there is exactly one file
+    present. This enforces the constraint that only one file can exist in the
+    channel at a time.
+
+    Args:
+        channel_id (str): Slack channel ID, defaults to CHANNEL_ID from environment
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
+
+    Returns:
+        bool: True if exactly one file exists, False if no files exist
+
+    Raises:
+        ValueError: If more than one file exists in the channel
+        SlackApiError: If the Slack API call fails
+
+    Examples:
+        >>> if poll_channel():
+        ...     print("File ready for processing")
+    """
+    logger = _get_logger()
+    config = get_config()
+
+    channel_id = channel_id or config['channel_id']
+    bot_token = bot_token or config['bot_token']
+
+    if channel_id is None:
+        raise ValueError("channel_id not provided and CHANNEL_ID not in environment")
+
+    try:
+        client = _create_bot_client(bot_token)
+        response = client.files_list(channel=channel_id)
+        file_count = len(response["files"])
+
+        if file_count == 1:
+            logger.info("Poll successful. Found one file in Slack channel.")
+            return True
+        elif file_count == 0:
+            logger.info("Poll successful. No files in Slack channel")
+            return False
         else:
-            self.logger.info("No files to download")
-        
-    # we may not need to use share_file in addition to upload file
-        
-    def _upload_file(self, file_path: str, image_title: str, initial_comment: str = None) -> None:
-        """Upload a file to the Slack channel.
-
-        Uploads a file to the channel and stores the response for later use.
-        The uploaded file will be visible to all channel members.
-
-        Args:
-            file_path (str): Path to the file to be uploaded.
-            image_title (str): Title/name for the file in Slack.
-            initial_comment (str, optional): Comment to post with the file.
-                Defaults to None.
-
-        Raises:
-            SlackApiError: If the Slack API call fails.
-        """
-        client = WebClient(self.bot_token)
-        try:
-            self.new_file = client.files_upload_v2(
-            channel=self.channel_id,
-            title=image_title,
-            file=file_path,
-            initial_comment=initial_comment)
-            self.logger.info(f"File '{image_title}' uploaded successfully to Slack")
-        except SlackApiError as e:
-            self.logger.exception(e)
-    
-    def _share_file(self) -> None:
-        """Post a message with the uploaded file URL to the channel.
-
-        Shares the uploaded file with the channel by posting a message containing
-        the file permalink. Note: files_upload_v2 already makes files visible in
-        the channel, so this is optional.
-
-        Raises:
-            SlackApiError: If the Slack API call fails.
-        """
-        client = WebClient(self.bot_token)
-        try:
-            self.file_url = self.new_file.get("file").get("permalink")
-            self.new_message = client.chat_postMessage(
-            channel=self.channel_id,
-            text=f"Here is the file url: {self.file_url}")
-            self.logger.info(f"File shared successfully with URL: {self.file_url}")
-        except SlackApiError as e:
-            self.logger.exception(e)
-    
-    def publish_file(self, file_path: str, image_title: str, initial_comment: str) -> None:
-        """Upload and publish a file to the Slack channel.
-
-        Uploads a file to the channel with a title and optional comment.
-        The file becomes immediately visible to all channel members.
-
-        Args:
-            file_path (str): Path to the file to be uploaded.
-            image_title (str): Title/name for the file in Slack.
-            initial_comment (str): Comment to post with the file.
-
-        Raises:
-            SlackApiError: If the Slack API call fails.
-        """
-        self._upload_file(file_path, image_title, initial_comment)
-        #self._share_file()
-        #return self.file_url
-    
-    # SAME INFO NEEDED AS DOWNLOAD FILE - need to know what file to delete
-    # _get_file_info() can just retrieve the list of all files in the channel then filter the metadata later
-    # use this to create methods: _get_file_by_date, _get_file_by_user
-    # _get_file_info will pass the returned list of files to the filtering functions
-    # the data retrieved from these methods will be used to DELETE a file or files
-    
-    def delete_files(self) -> None:
-        """Delete the file from the Slack channel.
-
-        Removes the file from the channel. Requires a user token because bots
-        cannot delete files they don't own. This is typically called after
-        downloading a file to prepare the channel for the next file.
-
-        Requires:
-            user_token: Must be set during initialization.
-
-        Raises:
-            SlackApiError: If the Slack API call fails.
-        """
-        self._get_file_info()
-        if self.file_id is not None:
-            client = WebClient(self.user_token)
-            try:
-                client.files_delete(file=self.file_id)
-                self.logger.info(f"File '{self.file_id}' has been deleted from Slack")
-            except SlackApiError as e:
-                self.logger.exception(e)
-        else:
-            self.logger.info("No files to delete")
-    
-    def send_message(self, message: str) -> None:
-        """Send a text message to the Slack channel.
-
-        Posts a message to the channel as the bot.
-
-        Args:
-            message (str): The text message to send.
-
-        Raises:
-            SlackApiError: If the Slack API call fails.
-        """
-        client = WebClient(self.bot_token)
-        try:
-            client.chat_postMessage(
-                channel=self.channel_id,
-                text=message
+            error_message = (
+                f"During polling, found {file_count} files in the channel. "
+                "There can only be max one file in the channel. "
+                "Manually delete the unnecessary files in the channel."
             )
-            self.logger.info("Message sent successfully to Slack channel")
-        except SlackApiError as e:
-            self.logger.exception(e)
+            logger.error(error_message)
+            raise ValueError(error_message)
+    except SlackApiError as e:
+        logger.exception(f"Slack API error during polling")
+        raise
+
+
+def get_file_info(channel_id: str = None, bot_token: str = None) -> dict | None:
+    """Retrieve file information from the Slack channel.
+
+    Gets metadata for the file in the channel. Assumes 0 or 1 files exist.
+
+    Args:
+        channel_id (str): Slack channel ID, defaults to CHANNEL_ID from environment
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
+
+    Returns:
+        dict: File info with keys: file_name, url_private, file_id
+        None: If no files in channel
+
+    Raises:
+        ValueError: If more than one file exists in the channel
+        SlackApiError: If the Slack API call fails
+
+    Examples:
+        >>> file_info = get_file_info()
+        >>> if file_info:
+        ...     print(f"File: {file_info['file_name']}")
+    """
+    logger = _get_logger()
+    config = get_config()
+
+    channel_id = channel_id or config['channel_id']
+    bot_token = bot_token or config['bot_token']
+
+    if channel_id is None:
+        raise ValueError("channel_id not provided and CHANNEL_ID not in environment")
+
+    try:
+        client = _create_bot_client(bot_token)
+        response = client.files_list(channel=channel_id)
+        file_count = len(response["files"])
+
+        if file_count == 1:
+            file_data = response["files"][0]
+            file_info = {
+                'file_name': file_data["name"],
+                'url_private': file_data["url_private"],
+                'file_id': file_data["id"]
+            }
+            logger.info("Retrieved file info from file in Slack")
+            return file_info
+        elif file_count == 0:
+            logger.info("File retrieval successful. No files in Slack channel")
+            return None
+        else:
+            error_message = (
+                f"There are {file_count} files in the channel. "
+                "There can only be max one file in the channel."
+            )
+            logger.error(error_message)
+            raise ValueError(error_message)
+    except SlackApiError as e:
+        logger.exception(f"Slack API error retrieving file info")
+        raise
+
+
+def download_file(
+    output_dir: str,
+    channel_id: str = None,
+    bot_token: str = None
+) -> str | None:
+    """Download file from Slack channel to local filesystem.
+
+    Retrieves file information from the channel and downloads it to the specified
+    output directory using the private URL with bot authentication.
+
+    Args:
+        output_dir (str): Directory path where the file will be saved
+        channel_id (str): Slack channel ID, defaults to CHANNEL_ID from environment
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
+
+    Returns:
+        str: Full path to downloaded file
+        None: If no files in channel
+
+    Raises:
+        requests.exceptions.RequestException: If file download fails
+        SlackApiError: If Slack API call fails
+        ValueError: If more than one file exists
+
+    Examples:
+        >>> output_path = download_file("./downloads")
+        >>> if output_path:
+        ...     print(f"Downloaded to: {output_path}")
+    """
+    logger = _get_logger()
+    config = get_config()
+
+    bot_token = bot_token or config['bot_token']
+
+    file_info = get_file_info(channel_id, bot_token)
+
+    if file_info is None:
+        logger.info("No files to download")
+        return None
+
+    output_path = f"{output_dir}/{file_info['file_name']}"
+
+    try:
+        headers = {'Authorization': f'Bearer {bot_token}'}
+        download_response = requests.get(
+            file_info['url_private'],
+            headers=headers,
+            stream=True
+        )
+        download_response.raise_for_status()
+
+        with open(output_path, 'wb') as f:
+            for chunk in download_response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        logger.info(f"File download successful. File saved to: {output_path}")
+        return output_path
+    except requests.exceptions.RequestException as e:
+        logger.exception(f"Request error during file download")
+        raise
+    except IOError as e:
+        logger.exception(f"IO error writing file to {output_path}")
+        raise
+
+
+def upload_file(
+    file_path: str,
+    title: str = None,
+    initial_comment: str = None,
+    channel_id: str = None,
+    bot_token: str = None
+) -> str:
+    """Upload file to Slack channel.
+
+    Uploads a file to the channel with optional title and comment.
+    The file becomes immediately visible to all channel members.
+
+    Args:
+        file_path (str): Path to the file to upload
+        title (str): Title/name for the file in Slack, defaults to filename
+        initial_comment (str): Optional comment to post with the file
+        channel_id (str): Slack channel ID, defaults to CHANNEL_ID from environment
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
+
+    Returns:
+        str: Permalink URL of the uploaded file
+
+    Raises:
+        SlackApiError: If Slack API call fails
+        FileNotFoundError: If file_path doesn't exist
+
+    Examples:
+        >>> file_url = upload_file("report.pdf", title="Weekly Report")
+        >>> print(f"Uploaded to: {file_url}")
+    """
+    logger = _get_logger()
+    config = get_config()
+
+    channel_id = channel_id or config['channel_id']
+    bot_token = bot_token or config['bot_token']
+
+    if channel_id is None:
+        raise ValueError("channel_id not provided and CHANNEL_ID not in environment")
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    if title is None:
+        title = os.path.basename(file_path)
+
+    try:
+        client = _create_bot_client(bot_token)
+        response = client.files_upload_v2(
+            channel=channel_id,
+            title=title,
+            file=file_path,
+            initial_comment=initial_comment
+        )
+        file_url = response.get("file", {}).get("permalink_public")
+        logger.info(f"File '{title}' uploaded successfully to Slack")
+        return file_url
+    except SlackApiError as e:
+        logger.exception(f"Slack API error during file upload")
+        raise
+
+
+def delete_file(
+    channel_id: str = None,
+    user_token: str = None
+) -> bool:
+    """Delete file from Slack channel.
+
+    Removes the file from the channel. Requires a user token because bots cannot
+    delete files they don't own. This is typically called after downloading a file
+    to prepare the channel for the next file.
+
+    Args:
+        channel_id (str): Slack channel ID, defaults to CHANNEL_ID from environment
+        user_token (str): User token, defaults to USER_TOKEN from environment
+
+    Returns:
+        bool: True if file was deleted, False if no files to delete
+
+    Raises:
+        SlackApiError: If Slack API call fails
+        ValueError: If user_token not provided and not in environment
+
+    Examples:
+        >>> if delete_file():
+        ...     print("File deleted successfully")
+    """
+    logger = _get_logger()
+    config = get_config()
+
+    channel_id = channel_id or config['channel_id']
+
+    if channel_id is None:
+        raise ValueError("channel_id not provided and CHANNEL_ID not in environment")
+
+    file_info = get_file_info(channel_id)
+
+    if file_info is None:
+        logger.info("No files to delete")
+        return False
+
+    try:
+        client = _create_user_client(user_token)
+        client.files_delete(file=file_info['file_id'])
+        logger.info(f"File '{file_info['file_id']}' has been deleted from Slack")
+        return True
+    except SlackApiError as e:
+        logger.exception(f"Slack API error during file deletion")
+        raise
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        raise
+
+
+# ============================================================================
+# MESSAGING
+# ============================================================================
+
+
+def send_message(
+    message: str,
+    channel_id: str = None,
+    bot_token: str = None
+) -> dict:
+    """Send text message to Slack channel.
+
+    Posts a message to the channel as the bot.
+
+    Args:
+        message (str): The text message to send
+        channel_id (str): Slack channel ID, defaults to CHANNEL_ID from environment
+        bot_token (str): Bot token, defaults to BOT_TOKEN from environment
+
+    Returns:
+        dict: Message response with keys: ok, channel, ts, message
+
+    Raises:
+        SlackApiError: If Slack API call fails
+
+    Examples:
+        >>> response = send_message("Processing complete")
+        >>> print(f"Message sent at {response['ts']}")
+    """
+    logger = _get_logger()
+    config = get_config()
+
+    channel_id = channel_id or config['channel_id']
+    bot_token = bot_token or config['bot_token']
+
+    if channel_id is None:
+        raise ValueError("channel_id not provided and CHANNEL_ID not in environment")
+
+    try:
+        client = _create_bot_client(bot_token)
+        response = client.chat_postMessage(
+            channel=channel_id,
+            text=message
+        )
+        logger.info("Message sent successfully to Slack channel")
+        return response
+    except SlackApiError as e:
+        logger.exception(f"Slack API error sending message")
+        raise
